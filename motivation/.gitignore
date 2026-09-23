@@ -1,0 +1,9 @@
+/data/
+/result/
+/cache/
+/dependencies/src/
+/dependencies/build/
+/dependencies/install/
+/code/native/frame_extract
+__pycache__/
+*.pyc

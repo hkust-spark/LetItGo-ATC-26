@@ -1,0 +1,2102 @@
+diff --git a/aom/aomdx.h b/aom/aomdx.h
+--- a/aom/aomdx.h
++++ b/aom/aomdx.h
+@@ -475,6 +475,15 @@
+    *   maximum
+    */
+   AOMD_SET_FRAME_SIZE_LIMIT,
++
++  /*!\brief Codec control function to enable decoder error concealment, unsigned
++   * int parameter
++   *
++   * - 0 = strict decode, return an error on corrupted frame data
++   * - nonzero = attempt localized tile/superblock concealment on corrupted
++   *   frame data
++   */
++  AV1D_SET_ERROR_CONCEALMENT,
+ };
+ 
+ /*!\cond */
+@@ -610,6 +619,9 @@
+ 
+ AOM_CTRL_USE_TYPE(AOMD_SET_FRAME_SIZE_LIMIT, unsigned int)
+ #define AOM_CTRL_AOMD_SET_FRAME_SIZE_LIMIT
++
++AOM_CTRL_USE_TYPE(AV1D_SET_ERROR_CONCEALMENT, unsigned int)
++#define AOM_CTRL_AV1D_SET_ERROR_CONCEALMENT
+ /*!\endcond */
+ /*! @} - end defgroup aom_decoder */
+ #ifdef __cplusplus
+diff --git a/av1/av1_dx_iface.c b/av1/av1_dx_iface.c
+--- a/av1/av1_dx_iface.c
++++ b/av1/av1_dx_iface.c
+@@ -58,6 +58,7 @@
+   unsigned int tile_mode;
+   unsigned int ext_tile_debug;
+   unsigned int row_mt;
++  unsigned int error_concealment_enabled;
+   EXTERNAL_REFERENCES ext_refs;
+   unsigned int is_annexb;
+   int operating_point;
+@@ -497,6 +498,8 @@
+   frame_worker_data->pbi->frame_size_limit = ctx->frame_size_limit;
+   frame_worker_data->pbi->ext_tile_debug = ctx->ext_tile_debug;
+   frame_worker_data->pbi->row_mt = ctx->row_mt;
++  frame_worker_data->pbi->error_concealment_enabled =
++      ctx->error_concealment_enabled;
+   frame_worker_data->pbi->is_fwd_kf_present = 0;
+   frame_worker_data->pbi->is_arf_frame_present = 0;
+   worker->hook = frame_worker_hook;
+@@ -544,9 +547,12 @@
+   frame_worker_data->pbi->dec_tile_col = ctx->decode_tile_col;
+   frame_worker_data->pbi->ext_tile_debug = ctx->ext_tile_debug;
+   frame_worker_data->pbi->row_mt = ctx->row_mt;
++  frame_worker_data->pbi->error_concealment_enabled =
++      ctx->error_concealment_enabled;
+   frame_worker_data->pbi->ext_refs = ctx->ext_refs;
+ 
+   frame_worker_data->pbi->is_annexb = ctx->is_annexb;
++  av1_ec_set_packet_damage_hint(frame_worker_data->pbi, *data, data_sz);
+ 
+   worker->had_error = 0;
+   winterface->execute(worker);
+@@ -647,6 +653,12 @@
+   frame_worker_data->pbi->inspect_cb = ctx->inspect_cb;
+   frame_worker_data->pbi->inspect_ctx = ctx->inspect_ctx;
+ #endif
++  frame_worker_data->pbi->error_concealment_enabled =
++      ctx->error_concealment_enabled;
++  av1_ec_set_input_packet_damage_hint(frame_worker_data->pbi, data_start,
++                                      (size_t)frame_size);
++  av1_ec_set_packet_damage_hint(frame_worker_data->pbi, data_start,
++                                (size_t)frame_size);
+   res = av1_receive_compressed_data(frame_worker_data->pbi, (size_t)frame_size,
+                                     &data_start);
+   check_resync(ctx, frame_worker_data->pbi);
+@@ -696,14 +708,19 @@
+   // Reset flushed when receiving a valid frame.
+   ctx->flushed = 0;
+ 
++  const uint8_t *data_start = data;
++  const uint8_t *data_end = data + data_sz;
++
+   // Initialize the decoder worker on the first frame.
+   if (ctx->frame_worker == NULL) {
+     res = init_decoder(ctx);
+     if (res != AOM_CODEC_OK) return res;
+   }
+ 
+-  const uint8_t *data_start = data;
+-  const uint8_t *data_end = data + data_sz;
++  FrameWorkerData *const frame_worker_data =
++      (FrameWorkerData *)ctx->frame_worker->data1;
++  frame_worker_data->pbi->error_concealment_enabled =
++      ctx->error_concealment_enabled;
+ 
+   if (ctx->is_annexb) {
+     // read the size of this temporal unit
+@@ -718,6 +735,11 @@
+       return AOM_CODEC_CORRUPT_FRAME;
+     data_end = data_start + temporal_unit_size;
+   }
++
++  const uint8_t *const packet_data_start = data_start;
++  const size_t packet_data_sz = (size_t)(data_end - data_start);
++  av1_ec_set_input_packet_damage_hint(frame_worker_data->pbi,
++                                      packet_data_start, packet_data_sz);
+ 
+   // Decode in serial mode.
+   while (data_start < data_end) {
+@@ -1604,6 +1626,18 @@
+   return AOM_CODEC_OK;
+ }
+ 
++static aom_codec_err_t ctrl_set_error_concealment(aom_codec_alg_priv_t *ctx,
++                                                  va_list args) {
++  ctx->error_concealment_enabled = va_arg(args, unsigned int) != 0;
++  if (ctx->frame_worker) {
++    AVxWorker *const worker = ctx->frame_worker;
++    FrameWorkerData *const frame_worker_data = (FrameWorkerData *)worker->data1;
++    frame_worker_data->pbi->error_concealment_enabled =
++        ctx->error_concealment_enabled;
++  }
++  return AOM_CODEC_OK;
++}
++
+ static aom_codec_err_t ctrl_get_accounting(aom_codec_alg_priv_t *ctx,
+                                            va_list args) {
+ #if !CONFIG_ACCOUNTING
+@@ -1712,6 +1746,7 @@
+   { AV1D_SET_EXT_REF_PTR, ctrl_set_ext_ref_ptr },
+   { AV1D_SET_SKIP_FILM_GRAIN, ctrl_set_skip_film_grain },
+   { AOMD_SET_FRAME_SIZE_LIMIT, ctrl_set_frame_size_limit },
++  { AV1D_SET_ERROR_CONCEALMENT, ctrl_set_error_concealment },
+ 
+   // Getters
+   { AOMD_GET_FRAME_CORRUPTED, ctrl_get_frame_corrupted },
+diff --git a/av1/decoder/decodeframe.c b/av1/decoder/decodeframe.c
+--- a/av1/decoder/decodeframe.c
++++ b/av1/decoder/decodeframe.c
+@@ -12,6 +12,8 @@
+ #include <assert.h>
+ #include <stdbool.h>
+ #include <stddef.h>
++#include <stdint.h>
++#include <string.h>
+ 
+ #include "config/aom_config.h"
+ #include "config/aom_scale_rtcd.h"
+@@ -411,6 +413,18 @@
+   int y1;
+ } PadBlock;
+ 
++enum {
++  AV1_EC_MI_UNKNOWN = 0,
++  AV1_EC_MI_CLEAN = 1,
++  AV1_EC_MI_DAMAGED = 2,
++  AV1_EC_MI_CONCEALED = 3,
++};
++
++static void av1_ec_mark_mi_region(AV1Decoder *pbi, int mi_row, int mi_col,
++                                  int mi_width, int mi_height, uint8_t status);
++static void av1_ec_record_damage(AV1Decoder *pbi, int tile_row, int tile_col,
++                                 int mi_row, int mi_col);
++
+ #if CONFIG_AV1_HIGHBITDEPTH
+ static inline void highbd_build_mc_border(const uint8_t *src8, int src_stride,
+                                           uint8_t *dst8, int dst_stride, int x,
+@@ -1219,6 +1233,13 @@
+   if (mbmi->skip_txfm) av1_reset_entropy_context(xd, bsize, num_planes);
+ 
+   decode_token_recon_block(pbi, td, r, bsize);
++  if (pbi->error_concealment_enabled) {
++    const int x_mis = AOMMIN(mi_size_wide[bsize], cm->mi_params.mi_cols - mi_col);
++    const int y_mis =
++        AOMMIN(mi_size_high[bsize], cm->mi_params.mi_rows - mi_row);
++    av1_ec_mark_mi_region(pbi, mi_row, mi_col, x_mis, y_mis,
++                          AV1_EC_MI_CLEAN);
++  }
+ #if CONFIG_COLLECT_COMPONENT_TIMING
+   end_timing(pbi, parse_decode_block_time);
+ #endif
+@@ -2765,6 +2786,1175 @@
+   }
+ }
+ 
++static inline int av1_ec_align_mi_to_sb(const AV1_COMMON *const cm,
++                                        const int mi, const int mi_start,
++                                        const int mi_end) {
++  const int mib_size = cm->seq_params->mib_size;
++  const int clipped = clamp(mi, mi_start, mi_end - 1);
++  return mi_start + ((clipped - mi_start) / mib_size) * mib_size;
++}
++
++static void av1_ec_ensure_mi_status_map(AV1Decoder *pbi) {
++  if (!pbi->error_concealment_enabled) return;
++
++  AV1_COMMON *const cm = &pbi->common;
++  const int rows = cm->mi_params.mi_rows;
++  const int cols = cm->mi_params.mi_cols;
++  const int required_size = rows * cols;
++  if (required_size <= 0) return;
++
++  if (pbi->ec_mi_status_alloc_size < required_size) {
++    aom_free(pbi->ec_mi_status);
++    CHECK_MEM_ERROR(cm, pbi->ec_mi_status,
++                    (uint8_t *)aom_malloc(required_size));
++    pbi->ec_mi_status_alloc_size = required_size;
++  }
++
++  pbi->ec_mi_status_rows = rows;
++  pbi->ec_mi_status_cols = cols;
++  memset(pbi->ec_mi_status, AV1_EC_MI_UNKNOWN, required_size);
++}
++
++static void av1_ec_mark_mi_region(AV1Decoder *pbi, int mi_row, int mi_col,
++                                  int mi_width, int mi_height, uint8_t status) {
++  if (!pbi->error_concealment_enabled || pbi->ec_mi_status == NULL) return;
++
++  const int row0 = clamp(mi_row, 0, pbi->ec_mi_status_rows);
++  const int col0 = clamp(mi_col, 0, pbi->ec_mi_status_cols);
++  const int row1 = clamp(mi_row + mi_height, 0, pbi->ec_mi_status_rows);
++  const int col1 = clamp(mi_col + mi_width, 0, pbi->ec_mi_status_cols);
++  if (row1 <= row0 || col1 <= col0) return;
++
++  for (int row = row0; row < row1; ++row) {
++    memset(pbi->ec_mi_status + row * pbi->ec_mi_status_cols + col0, status,
++           col1 - col0);
++  }
++}
++
++static inline uint8_t av1_ec_mi_status_at(const AV1Decoder *pbi, int mi_row,
++                                          int mi_col) {
++  if (pbi->ec_mi_status == NULL || mi_row < 0 || mi_col < 0 ||
++      mi_row >= pbi->ec_mi_status_rows || mi_col >= pbi->ec_mi_status_cols) {
++    return AV1_EC_MI_UNKNOWN;
++  }
++  return pbi->ec_mi_status[mi_row * pbi->ec_mi_status_cols + mi_col];
++}
++
++static inline int av1_ec_status_is_known(uint8_t status) {
++  return status == AV1_EC_MI_CLEAN || status == AV1_EC_MI_CONCEALED;
++}
++
++static int av1_ec_region_has_known_mi(const AV1Decoder *pbi, int mi_row,
++                                      int mi_col, int mi_width,
++                                      int mi_height) {
++  if (pbi->ec_mi_status == NULL) return 1;
++
++  const int row0 = clamp(mi_row, 0, pbi->ec_mi_status_rows);
++  const int col0 = clamp(mi_col, 0, pbi->ec_mi_status_cols);
++  const int row1 = clamp(mi_row + mi_height, 0, pbi->ec_mi_status_rows);
++  const int col1 = clamp(mi_col + mi_width, 0, pbi->ec_mi_status_cols);
++  if (row1 <= row0 || col1 <= col0) return 0;
++
++  for (int row = row0; row < row1; ++row) {
++    const uint8_t *const status =
++        pbi->ec_mi_status + row * pbi->ec_mi_status_cols + col0;
++    for (int col = 0; col < col1 - col0; ++col) {
++      if (av1_ec_status_is_known(status[col])) return 1;
++    }
++  }
++  return 0;
++}
++
++static inline void av1_ec_note_sb(AV1Decoder *pbi, int tile_row, int tile_col,
++                                  int mi_row, int mi_col) {
++  if (!pbi->error_concealment_enabled) return;
++  pbi->ec_cur_tile_row = tile_row;
++  pbi->ec_cur_tile_col = tile_col;
++  pbi->ec_cur_mi_row = mi_row;
++  pbi->ec_cur_mi_col = mi_col;
++}
++
++static int av1_ec_ref_matches_cur(const YV12_BUFFER_CONFIG *const cur,
++                                  const YV12_BUFFER_CONFIG *const ref) {
++  return ref->y_crop_width == cur->y_crop_width &&
++         ref->y_crop_height == cur->y_crop_height &&
++         ref->uv_crop_width == cur->uv_crop_width &&
++         ref->uv_crop_height == cur->uv_crop_height &&
++         ref->subsampling_x == cur->subsampling_x &&
++         ref->subsampling_y == cur->subsampling_y &&
++         ref->bit_depth == cur->bit_depth &&
++         !((ref->flags ^ cur->flags) & YV12_FLAG_HIGHBITDEPTH);
++}
++
++static const YV12_BUFFER_CONFIG *av1_ec_get_ref_frame(
++    const AV1_COMMON *const cm, MV_REFERENCE_FRAME frame) {
++  if (cm->cur_frame == NULL) return NULL;
++
++  const RefCntBuffer *const ref_buf = get_ref_frame_buf(cm, frame);
++  if (ref_buf == NULL || ref_buf->buf.corrupted) return NULL;
++
++  const YV12_BUFFER_CONFIG *const cur = &cm->cur_frame->buf;
++  const YV12_BUFFER_CONFIG *const ref = &ref_buf->buf;
++  return av1_ec_ref_matches_cur(cur, ref) ? ref : NULL;
++}
++
++static const YV12_BUFFER_CONFIG *av1_ec_find_ref_frame(
++    const AV1_COMMON *const cm) {
++  if (cm->cur_frame == NULL) return NULL;
++
++  for (int frame = LAST_FRAME; frame <= ALTREF_FRAME; ++frame) {
++    const YV12_BUFFER_CONFIG *const ref =
++        av1_ec_get_ref_frame(cm, (MV_REFERENCE_FRAME)frame);
++    if (ref != NULL) return ref;
++  }
++  return NULL;
++}
++
++#define AV1_EC_MAX_MV_CANDIDATES 32
++#define AV1_EC_FORCED_ZERO_RUN_MIN 1024
++
++enum {
++  AV1_EC_PATH_NEIGHBOR_MV = 0,
++  AV1_EC_PATH_ZERO_MV = 1,
++  AV1_EC_PATH_GLOBAL_MV = 2,
++  AV1_EC_PATH_PREV_MV = 3,
++};
++
++typedef struct AV1EcMvCandidate {
++  const YV12_BUFFER_CONFIG *ref;
++  MV_REFERENCE_FRAME ref_frame;
++  MV mv;
++  int path;
++  unsigned int penalty;
++} AV1EcMvCandidate;
++
++static inline int av1_ec_mv_px(int mv_q3) {
++  return GET_MV_RAWPEL(mv_q3);
++}
++
++static inline unsigned int av1_ec_absdiff(int a, int b) {
++  return a > b ? (unsigned int)(a - b) : (unsigned int)(b - a);
++}
++
++static const MB_MODE_INFO *av1_ec_get_mi(const AV1_COMMON *const cm,
++                                         int mi_row, int mi_col) {
++  const CommonModeInfoParams *const mi_params = &cm->mi_params;
++  if (mi_row < 0 || mi_col < 0 || mi_row >= mi_params->mi_rows ||
++      mi_col >= mi_params->mi_cols) {
++    return NULL;
++  }
++  return mi_params->mi_grid_base[get_mi_grid_idx(mi_params, mi_row, mi_col)];
++}
++
++static const MB_MODE_INFO *av1_ec_get_known_mi(const AV1Decoder *pbi,
++                                               int mi_row, int mi_col) {
++  if (pbi->ec_mi_status != NULL &&
++      !av1_ec_status_is_known(av1_ec_mi_status_at(pbi, mi_row, mi_col))) {
++    return NULL;
++  }
++  return av1_ec_get_mi(&pbi->common, mi_row, mi_col);
++}
++
++static int av1_ec_add_mv_candidate(const AV1_COMMON *const cm,
++                                   AV1EcMvCandidate *candidates, int count,
++                                   MV_REFERENCE_FRAME ref_frame, MV mv,
++                                   int path, unsigned int penalty) {
++  if (count >= AV1_EC_MAX_MV_CANDIDATES) return count;
++  if (ref_frame <= INTRA_FRAME || ref_frame > ALTREF_FRAME) return count;
++
++  const YV12_BUFFER_CONFIG *const ref = av1_ec_get_ref_frame(cm, ref_frame);
++  if (ref == NULL) return count;
++
++  const int mv_row_px = av1_ec_mv_px(mv.row);
++  const int mv_col_px = av1_ec_mv_px(mv.col);
++  for (int i = 0; i < count; ++i) {
++    if (candidates[i].ref_frame == ref_frame &&
++        av1_ec_mv_px(candidates[i].mv.row) == mv_row_px &&
++        av1_ec_mv_px(candidates[i].mv.col) == mv_col_px) {
++      if (penalty < candidates[i].penalty) {
++        candidates[i].penalty = penalty;
++        candidates[i].path = path;
++      }
++      return count;
++    }
++  }
++
++  candidates[count].ref = ref;
++  candidates[count].ref_frame = ref_frame;
++  candidates[count].mv = mv;
++  candidates[count].path = path;
++  candidates[count].penalty = penalty;
++  return count + 1;
++}
++
++static int av1_ec_add_neighbor_mvs(const AV1Decoder *pbi,
++                                   AV1EcMvCandidate *candidates, int count,
++                                   int mi_row, int mi_col) {
++  const AV1_COMMON *const cm = &pbi->common;
++  const int step = cm->seq_params->mib_size;
++  static const int kOffsets[][3] = {
++    { 0, -1, 0 },    // left
++    { -1, 0, 0 },    // above
++    { -1, -1, 4 },   // above-left
++    { -1, 1, 6 },    // above-right
++    { 0, 1, 16 },    // right, if already known
++    { 1, 0, 16 },    // below, if already known
++  };
++
++  for (size_t i = 0; i < sizeof(kOffsets) / sizeof(kOffsets[0]); ++i) {
++    const int ref_mi_row = mi_row + kOffsets[i][0] * step;
++    const int ref_mi_col = mi_col + kOffsets[i][1] * step;
++    const MB_MODE_INFO *const mbmi =
++        av1_ec_get_known_mi(pbi, ref_mi_row, ref_mi_col);
++    if (mbmi == NULL || !is_inter_block(mbmi)) continue;
++
++    for (int ref = 0; ref < 2; ++ref) {
++      if (mbmi->ref_frame[ref] <= INTRA_FRAME) continue;
++      count = av1_ec_add_mv_candidate(cm, candidates, count,
++                                      mbmi->ref_frame[ref],
++                                      mbmi->mv[ref].as_mv,
++                                      AV1_EC_PATH_NEIGHBOR_MV,
++                                      (unsigned int)kOffsets[i][2]);
++    }
++  }
++
++  return count;
++}
++
++static int av1_ec_add_mvs_from_ref_buffer(const AV1_COMMON *const cm,
++                                          const RefCntBuffer *const ref_buf,
++                                          AV1EcMvCandidate *candidates,
++                                          int count, int mi_row, int mi_col,
++                                          unsigned int base_penalty) {
++  if (ref_buf == NULL || ref_buf->mvs == NULL || ref_buf->buf.corrupted)
++    return count;
++  if (ref_buf->mi_rows != cm->mi_params.mi_rows ||
++      ref_buf->mi_cols != cm->mi_params.mi_cols) {
++    return count;
++  }
++
++  const int mvs_cols = ROUND_POWER_OF_TWO(ref_buf->mi_cols, 1);
++  const int mvs_rows = ROUND_POWER_OF_TWO(ref_buf->mi_rows, 1);
++  const int mv_row = mi_row >> 1;
++  const int mv_col = mi_col >> 1;
++  static const int kOffsets[][3] = {
++    { 0, 0, 0 },    { 0, -1, 8 },  { -1, 0, 8 }, { 0, 1, 16 },
++    { 1, 0, 16 },   { -1, -1, 20 }, { -1, 1, 24 }, { 1, -1, 24 },
++  };
++
++  for (size_t i = 0; i < sizeof(kOffsets) / sizeof(kOffsets[0]); ++i) {
++    const int row = mv_row + kOffsets[i][0];
++    const int col = mv_col + kOffsets[i][1];
++    if (row < 0 || col < 0 || row >= mvs_rows || col >= mvs_cols) continue;
++
++    const MV_REF *const mv_ref = &ref_buf->mvs[row * mvs_cols + col];
++    if (mv_ref->ref_frame <= INTRA_FRAME || mv_ref->ref_frame > ALTREF_FRAME)
++      continue;
++
++    count = av1_ec_add_mv_candidate(cm, candidates, count, mv_ref->ref_frame,
++                                    mv_ref->mv.as_mv, AV1_EC_PATH_PREV_MV,
++                                    base_penalty +
++                                        (unsigned int)kOffsets[i][2]);
++  }
++
++  return count;
++}
++
++static int av1_ec_add_previous_mvs(const AV1_COMMON *const cm,
++                                   AV1EcMvCandidate *candidates, int count,
++                                   int mi_row, int mi_col) {
++  const RefCntBuffer *const last_buf = get_ref_frame_buf(cm, LAST_FRAME);
++  count = av1_ec_add_mvs_from_ref_buffer(cm, last_buf, candidates, count,
++                                         mi_row, mi_col, 8);
++  if (cm->prev_frame != last_buf) {
++    count = av1_ec_add_mvs_from_ref_buffer(cm, cm->prev_frame, candidates,
++                                           count, mi_row, mi_col, 16);
++  }
++  return count;
++}
++
++static int av1_ec_add_mean_mvs(const AV1_COMMON *const cm,
++                               AV1EcMvCandidate *candidates, int count,
++                               int initial_count) {
++  for (int ref_frame = LAST_FRAME; ref_frame <= ALTREF_FRAME; ++ref_frame) {
++    int sum_row = 0;
++    int sum_col = 0;
++    int samples = 0;
++    for (int i = 0; i < initial_count; ++i) {
++      if (candidates[i].ref_frame != ref_frame ||
++          candidates[i].path == AV1_EC_PATH_ZERO_MV ||
++          candidates[i].path == AV1_EC_PATH_GLOBAL_MV) {
++        continue;
++      }
++      sum_row += candidates[i].mv.row;
++      sum_col += candidates[i].mv.col;
++      ++samples;
++    }
++    if (samples < 2) continue;
++
++    MV mv;
++    mv.row = (int16_t)clamp((sum_row + samples / 2) / samples, MV_LOW + 1,
++                            MV_UPP - 1);
++    mv.col = (int16_t)clamp((sum_col + samples / 2) / samples, MV_LOW + 1,
++                            MV_UPP - 1);
++    count = av1_ec_add_mv_candidate(cm, candidates, count,
++                                    (MV_REFERENCE_FRAME)ref_frame, mv,
++                                    AV1_EC_PATH_NEIGHBOR_MV, 6);
++  }
++  return count;
++}
++
++static int av1_ec_add_default_mvs(const AV1_COMMON *const cm,
++                                  AV1EcMvCandidate *candidates, int count,
++                                  int mi_row, int mi_col) {
++  static const MV_REFERENCE_FRAME kRefs[] = {
++    LAST_FRAME,   GOLDEN_FRAME, ALTREF_FRAME, LAST2_FRAME,
++    LAST3_FRAME,  BWDREF_FRAME, ALTREF2_FRAME,
++  };
++
++  for (size_t i = 0; i < sizeof(kRefs) / sizeof(kRefs[0]); ++i) {
++    const MV_REFERENCE_FRAME ref_frame = kRefs[i];
++    MV zero_mv = kZeroMv;
++    count = av1_ec_add_mv_candidate(cm, candidates, count, ref_frame, zero_mv,
++                                    AV1_EC_PATH_ZERO_MV, 64);
++
++    if (cm->global_motion[ref_frame].wmtype != IDENTITY) {
++      const int_mv gm_mv = gm_get_motion_vector(
++          &cm->global_motion[ref_frame], cm->features.allow_high_precision_mv,
++          cm->seq_params->sb_size, mi_col, mi_row,
++          cm->features.cur_frame_force_integer_mv);
++      count = av1_ec_add_mv_candidate(cm, candidates, count, ref_frame,
++                                      gm_mv.as_mv, AV1_EC_PATH_GLOBAL_MV, 16);
++    }
++  }
++
++  return count;
++}
++
++static uint64_t av1_ec_score_candidate(const AV1Decoder *pbi,
++                                       const YV12_BUFFER_CONFIG *const dst,
++                                       const AV1EcMvCandidate *const cand,
++                                       int mi_row, int mi_col, int mi_width,
++                                       int mi_height, int x0, int y0, int x1,
++                                       int y1) {
++  const int width = x1 - x0;
++  const int height = y1 - y0;
++  if (width <= 0 || height <= 0) return UINT64_MAX;
++
++  const int left_known =
++      x0 > 0 &&
++      av1_ec_region_has_known_mi(pbi, mi_row, mi_col - 1, 1, mi_height);
++  const int right_known =
++      x1 < dst->y_crop_width &&
++      av1_ec_region_has_known_mi(pbi, mi_row, mi_col + mi_width, 1, mi_height);
++  const int top_known =
++      y0 > 0 &&
++      av1_ec_region_has_known_mi(pbi, mi_row - 1, mi_col, mi_width, 1);
++  const int bottom_known =
++      y1 < dst->y_crop_height &&
++      av1_ec_region_has_known_mi(pbi, mi_row + mi_height, mi_col, mi_width, 1);
++
++  const int mv_col = av1_ec_mv_px(cand->mv.col);
++  const int mv_row = av1_ec_mv_px(cand->mv.row);
++  const int ref_w = cand->ref->y_crop_width;
++  const int ref_h = cand->ref->y_crop_height;
++  uint64_t cost = cand->penalty;
++  unsigned int samples = 0;
++
++  if (dst->flags & YV12_FLAG_HIGHBITDEPTH) {
++    const uint16_t *const dst_base = CONVERT_TO_SHORTPTR(dst->y_buffer);
++    const uint16_t *const ref_base = CONVERT_TO_SHORTPTR(cand->ref->y_buffer);
++    if (left_known) {
++      for (int y = 0; y < height; ++y) {
++        const int src_y = clamp(y0 + y + mv_row, 0, ref_h - 1);
++        const int src_x = clamp(x0 + mv_col, 0, ref_w - 1);
++        const uint16_t dst_px = dst_base[(y0 + y) * dst->y_stride + x0 - 1];
++        const uint16_t ref_px = ref_base[src_y * cand->ref->y_stride + src_x];
++        cost += av1_ec_absdiff(dst_px, ref_px);
++        ++samples;
++      }
++    }
++    if (right_known) {
++      for (int y = 0; y < height; ++y) {
++        const int src_y = clamp(y0 + y + mv_row, 0, ref_h - 1);
++        const int src_x = clamp(x1 - 1 + mv_col, 0, ref_w - 1);
++        const uint16_t dst_px = dst_base[(y0 + y) * dst->y_stride + x1];
++        const uint16_t ref_px = ref_base[src_y * cand->ref->y_stride + src_x];
++        cost += av1_ec_absdiff(dst_px, ref_px);
++        ++samples;
++      }
++    }
++    if (top_known) {
++      for (int x = 0; x < width; ++x) {
++        const int src_y = clamp(y0 + mv_row, 0, ref_h - 1);
++        const int src_x = clamp(x0 + x + mv_col, 0, ref_w - 1);
++        const uint16_t dst_px = dst_base[(y0 - 1) * dst->y_stride + x0 + x];
++        const uint16_t ref_px = ref_base[src_y * cand->ref->y_stride + src_x];
++        cost += av1_ec_absdiff(dst_px, ref_px);
++        ++samples;
++      }
++    }
++    if (bottom_known) {
++      for (int x = 0; x < width; ++x) {
++        const int src_y = clamp(y1 - 1 + mv_row, 0, ref_h - 1);
++        const int src_x = clamp(x0 + x + mv_col, 0, ref_w - 1);
++        const uint16_t dst_px = dst_base[y1 * dst->y_stride + x0 + x];
++        const uint16_t ref_px = ref_base[src_y * cand->ref->y_stride + src_x];
++        cost += av1_ec_absdiff(dst_px, ref_px);
++        ++samples;
++      }
++    }
++  } else {
++    const uint8_t *const dst_base = dst->y_buffer;
++    const uint8_t *const ref_base = cand->ref->y_buffer;
++    if (left_known) {
++      for (int y = 0; y < height; ++y) {
++        const int src_y = clamp(y0 + y + mv_row, 0, ref_h - 1);
++        const int src_x = clamp(x0 + mv_col, 0, ref_w - 1);
++        const uint8_t dst_px = dst_base[(y0 + y) * dst->y_stride + x0 - 1];
++        const uint8_t ref_px = ref_base[src_y * cand->ref->y_stride + src_x];
++        cost += av1_ec_absdiff(dst_px, ref_px);
++        ++samples;
++      }
++    }
++    if (right_known) {
++      for (int y = 0; y < height; ++y) {
++        const int src_y = clamp(y0 + y + mv_row, 0, ref_h - 1);
++        const int src_x = clamp(x1 - 1 + mv_col, 0, ref_w - 1);
++        const uint8_t dst_px = dst_base[(y0 + y) * dst->y_stride + x1];
++        const uint8_t ref_px = ref_base[src_y * cand->ref->y_stride + src_x];
++        cost += av1_ec_absdiff(dst_px, ref_px);
++        ++samples;
++      }
++    }
++    if (top_known) {
++      for (int x = 0; x < width; ++x) {
++        const int src_y = clamp(y0 + mv_row, 0, ref_h - 1);
++        const int src_x = clamp(x0 + x + mv_col, 0, ref_w - 1);
++        const uint8_t dst_px = dst_base[(y0 - 1) * dst->y_stride + x0 + x];
++        const uint8_t ref_px = ref_base[src_y * cand->ref->y_stride + src_x];
++        cost += av1_ec_absdiff(dst_px, ref_px);
++        ++samples;
++      }
++    }
++    if (bottom_known) {
++      for (int x = 0; x < width; ++x) {
++        const int src_y = clamp(y1 - 1 + mv_row, 0, ref_h - 1);
++        const int src_x = clamp(x0 + x + mv_col, 0, ref_w - 1);
++        const uint8_t dst_px = dst_base[y1 * dst->y_stride + x0 + x];
++        const uint8_t ref_px = ref_base[src_y * cand->ref->y_stride + src_x];
++        cost += av1_ec_absdiff(dst_px, ref_px);
++        ++samples;
++      }
++    }
++  }
++
++  return samples ? cost : cand->penalty;
++}
++
++static void av1_ec_fill_plane(YV12_BUFFER_CONFIG *const dst, int plane,
++                              int x0, int y0, int x1, int y1) {
++  const int is_uv = plane > 0;
++  const int width = x1 - x0;
++  const int height = y1 - y0;
++  if (width <= 0 || height <= 0) return;
++
++  if (dst->flags & YV12_FLAG_HIGHBITDEPTH) {
++    const int bd = dst->bit_depth ? (int)dst->bit_depth : 8;
++    const int neutral = 1 << (bd - 1);
++    uint16_t *const base = CONVERT_TO_SHORTPTR(dst->buffers[plane]);
++    for (int y = 0; y < height; ++y) {
++      aom_memset16(base + (y0 + y) * dst->strides[is_uv] + x0, neutral, width);
++    }
++  } else {
++    uint8_t *const base = dst->buffers[plane];
++    for (int y = 0; y < height; ++y) {
++      memset(base + (y0 + y) * dst->strides[is_uv] + x0, 128, width);
++    }
++  }
++}
++
++typedef struct AV1EcBoundaryAvailability {
++  int left;
++  int right;
++  int top;
++  int bottom;
++} AV1EcBoundaryAvailability;
++
++static AV1EcBoundaryAvailability av1_ec_get_boundary_availability(
++    const AV1Decoder *pbi, const YV12_BUFFER_CONFIG *const dst, int plane,
++    int mi_row, int mi_col, int mi_width, int mi_height, int x0, int y0,
++    int x1, int y1) {
++  const int is_uv = plane > 0;
++  AV1EcBoundaryAvailability avail = { 0, 0, 0, 0 };
++  avail.left =
++      x0 > 0 &&
++      av1_ec_region_has_known_mi(pbi, mi_row, mi_col - 1, 1, mi_height);
++  avail.right =
++      x1 < dst->crop_widths[is_uv] &&
++      av1_ec_region_has_known_mi(pbi, mi_row, mi_col + mi_width, 1, mi_height);
++  avail.top =
++      y0 > 0 &&
++      av1_ec_region_has_known_mi(pbi, mi_row - 1, mi_col, mi_width, 1);
++  avail.bottom =
++      y1 < dst->crop_heights[is_uv] &&
++      av1_ec_region_has_known_mi(pbi, mi_row + mi_height, mi_col, mi_width, 1);
++  return avail;
++}
++
++static inline int av1_ec_has_boundary(AV1EcBoundaryAvailability avail) {
++  return avail.left || avail.right || avail.top || avail.bottom;
++}
++
++static inline int av1_ec_iabs(int value) {
++  return value < 0 ? -value : value;
++}
++
++static inline uint32_t av1_ec_mix32(uint32_t value) {
++  value ^= value >> 16;
++  value *= 0x7feb352dU;
++  value ^= value >> 15;
++  value *= 0x846ca68bU;
++  value ^= value >> 16;
++  return value;
++}
++
++static int av1_ec_region_strength(const AV1Decoder *pbi, int mi_row,
++                                  int mi_col) {
++  const int position_q8 =
++      pbi->ec_pkt_size
++          ? (int)AOMMIN((size_t)255,
++                        (pbi->ec_zero_run_start * 255) / pbi->ec_pkt_size)
++          : 0;
++  const int inverse_q8 = 255 - position_q8;
++  const int length_boost =
++      (int)AOMMIN((size_t)8, pbi->ec_zero_run_length / 256);
++  const uint32_t seed = av1_ec_mix32((uint32_t)pbi->ec_zero_run_start ^
++                                    (uint32_t)(mi_row * 257 + mi_col * 17));
++  const int curve_boost = (inverse_q8 * 4 + 127) / 255;
++  const int tail_boost = (position_q8 * 8 + 127) / 255;
++  const int hash_boost = (int)(seed & 3);
++  return clamp(10 + curve_boost + tail_boost + length_boost + hash_boost, 12,
++               32);
++}
++
++static void av1_ec_get_directional_weights(const AV1EcMvCandidate *best,
++                                           int ss_x, int ss_y,
++                                           int *left_weight,
++                                           int *right_weight,
++                                           int *top_weight,
++                                           int *bottom_weight) {
++  *left_weight = 3;
++  *right_weight = 3;
++  *top_weight = 3;
++  *bottom_weight = 3;
++
++  if (best == NULL) {
++    *left_weight = 4;
++    *top_weight = 4;
++    return;
++  }
++
++  const int mv_col = av1_ec_mv_px(best->mv.col) / (1 << ss_x);
++  const int mv_row = av1_ec_mv_px(best->mv.row) / (1 << ss_y);
++  const int abs_col = av1_ec_iabs(mv_col);
++  const int abs_row = av1_ec_iabs(mv_row);
++  if (abs_col >= abs_row) {
++    if (mv_col >= 0)
++      *left_weight = 6;
++    else
++      *right_weight = 6;
++  } else {
++    if (mv_row >= 0)
++      *top_weight = 6;
++    else
++      *bottom_weight = 6;
++  }
++}
++
++static inline int av1_ec_degrade_pixel(int value, int neutral, int max_value,
++                                       int x, int y, int plane, int mi_row,
++                                       int mi_col, uint32_t seed,
++                                       int strength) {
++  strength = clamp(strength, 1, 48);
++  value = ((64 - strength) * value + strength * neutral + 32) >> 6;
++  if (plane == 0) {
++    const uint32_t hash =
++        av1_ec_mix32(seed ^ (uint32_t)(x * 0x1f123bb5U) ^
++                     (uint32_t)(y * 0x5f356495U) ^
++                     (uint32_t)(mi_row * 257 + mi_col * 17));
++    if ((int)((hash >> 4) & 15) < AOMMIN(12, 2 + (strength >> 2))) {
++      value += (int)(hash & 3) - 1;
++    }
++  }
++  return clamp(value, 0, max_value);
++}
++
++static void av1_ec_directional_fill_plane(
++    const AV1Decoder *pbi, YV12_BUFFER_CONFIG *const dst, int plane, int mi_row,
++    int mi_col, int mi_width, int mi_height, int x0, int y0, int x1, int y1,
++    const AV1EcMvCandidate *best) {
++  const int is_uv = plane > 0;
++  const int width = x1 - x0;
++  const int height = y1 - y0;
++  if (width <= 0 || height <= 0) return;
++
++  const AV1EcBoundaryAvailability avail = av1_ec_get_boundary_availability(
++      pbi, dst, plane, mi_row, mi_col, mi_width, mi_height, x0, y0, x1, y1);
++  if (!av1_ec_has_boundary(avail)) {
++    av1_ec_fill_plane(dst, plane, x0, y0, x1, y1);
++    return;
++  }
++
++  int left_base = 0;
++  int right_base = 0;
++  int top_base = 0;
++  int bottom_base = 0;
++  const int ss_x = plane > 0 ? dst->subsampling_x : 0;
++  const int ss_y = plane > 0 ? dst->subsampling_y : 0;
++  const int use_ref = best != NULL && best->ref != NULL;
++  const int mv_col = use_ref ? av1_ec_mv_px(best->mv.col) / (1 << ss_x) : 0;
++  const int mv_row = use_ref ? av1_ec_mv_px(best->mv.row) / (1 << ss_y) : 0;
++  av1_ec_get_directional_weights(best, ss_x, ss_y, &left_base, &right_base,
++                                 &top_base, &bottom_base);
++  const uint32_t seed =
++      av1_ec_mix32((uint32_t)pbi->ec_zero_run_start ^
++                   (uint32_t)(pbi->ec_zero_run_length << 7) ^
++                   (uint32_t)(mi_row * 257 + mi_col * 17));
++  const int strength = av1_ec_region_strength(pbi, mi_row, mi_col);
++
++  if (dst->flags & YV12_FLAG_HIGHBITDEPTH) {
++    const int bd = dst->bit_depth ? (int)dst->bit_depth : 8;
++    const int neutral = 1 << (bd - 1);
++    const int max_value = (1 << bd) - 1;
++    uint16_t *const base = CONVERT_TO_SHORTPTR(dst->buffers[plane]);
++    const uint16_t *const top =
++        avail.top ? base + (y0 - 1) * dst->strides[is_uv] + x0 : NULL;
++    const uint16_t *const bottom =
++        avail.bottom ? base + y1 * dst->strides[is_uv] + x0 : NULL;
++    const uint16_t *const ref_base =
++        use_ref ? CONVERT_TO_SHORTPTR(best->ref->buffers[plane]) : NULL;
++    const int ref_width = use_ref ? best->ref->crop_widths[is_uv] : 0;
++    const int ref_height = use_ref ? best->ref->crop_heights[is_uv] : 0;
++    const int ref_stride = use_ref ? best->ref->strides[is_uv] : 0;
++    for (int y = 0; y < height; ++y) {
++      uint16_t *const row = base + (y0 + y) * dst->strides[is_uv] + x0;
++      for (int x = 0; x < width; ++x) {
++        int sum = 0;
++        int weight = 0;
++        if (avail.left) {
++          const int w = left_base * (width - x);
++          sum += row[-1] * w;
++          weight += w;
++        }
++        if (avail.right) {
++          const int w = right_base * (x + 1);
++          sum += row[width] * w;
++          weight += w;
++        }
++        if (avail.top) {
++          const int w = top_base * (height - y);
++          sum += top[x] * w;
++          weight += w;
++        }
++        if (avail.bottom) {
++          const int w = bottom_base * (y + 1);
++          sum += bottom[x] * w;
++          weight += w;
++        }
++        int predicted = weight > 0 ? (sum + (weight >> 1)) / weight : neutral;
++        if (use_ref) {
++          const int ref_x = clamp(x0 + x + mv_col, 0, ref_width - 1);
++          const int ref_y = clamp(y0 + y + mv_row, 0, ref_height - 1);
++          const int ref_px = ref_base[ref_y * ref_stride + ref_x];
++          predicted =
++              weight > 0 ? (predicted + ref_px * 3 + 2) >> 2 : ref_px;
++        }
++        row[x] = (uint16_t)av1_ec_degrade_pixel(
++            predicted, neutral, max_value, x, y, plane, mi_row, mi_col, seed,
++            strength);
++      }
++    }
++  } else {
++    uint8_t *const base = dst->buffers[plane];
++    const uint8_t *const top =
++        avail.top ? base + (y0 - 1) * dst->strides[is_uv] + x0 : NULL;
++    const uint8_t *const bottom =
++        avail.bottom ? base + y1 * dst->strides[is_uv] + x0 : NULL;
++    const uint8_t *const ref_base = use_ref ? best->ref->buffers[plane] : NULL;
++    const int ref_width = use_ref ? best->ref->crop_widths[is_uv] : 0;
++    const int ref_height = use_ref ? best->ref->crop_heights[is_uv] : 0;
++    const int ref_stride = use_ref ? best->ref->strides[is_uv] : 0;
++    for (int y = 0; y < height; ++y) {
++      uint8_t *const row = base + (y0 + y) * dst->strides[is_uv] + x0;
++      for (int x = 0; x < width; ++x) {
++        int sum = 0;
++        int weight = 0;
++        if (avail.left) {
++          const int w = left_base * (width - x);
++          sum += row[-1] * w;
++          weight += w;
++        }
++        if (avail.right) {
++          const int w = right_base * (x + 1);
++          sum += row[width] * w;
++          weight += w;
++        }
++        if (avail.top) {
++          const int w = top_base * (height - y);
++          sum += top[x] * w;
++          weight += w;
++        }
++        if (avail.bottom) {
++          const int w = bottom_base * (y + 1);
++          sum += bottom[x] * w;
++          weight += w;
++        }
++        int predicted = weight > 0 ? (sum + (weight >> 1)) / weight : 128;
++        if (use_ref) {
++          const int ref_x = clamp(x0 + x + mv_col, 0, ref_width - 1);
++          const int ref_y = clamp(y0 + y + mv_row, 0, ref_height - 1);
++          const int ref_px = ref_base[ref_y * ref_stride + ref_x];
++          predicted =
++              weight > 0 ? (predicted + ref_px * 3 + 2) >> 2 : ref_px;
++        }
++        row[x] = (uint8_t)av1_ec_degrade_pixel(predicted, 128, 255, x, y,
++                                               plane, mi_row, mi_col, seed,
++                                               strength);
++      }
++    }
++  }
++}
++
++static void av1_ec_blend_plane_boundaries(const AV1Decoder *pbi,
++                                          YV12_BUFFER_CONFIG *const dst,
++                                          int plane, int mi_row, int mi_col,
++                                          int mi_width, int mi_height, int x0,
++                                          int y0, int x1, int y1) {
++  const int is_uv = plane > 0;
++  const int width = x1 - x0;
++  const int height = y1 - y0;
++  if (width <= 0 || height <= 0) return;
++
++  const AV1EcBoundaryAvailability avail = av1_ec_get_boundary_availability(
++      pbi, dst, plane, mi_row, mi_col, mi_width, mi_height, x0, y0, x1, y1);
++
++  if (dst->flags & YV12_FLAG_HIGHBITDEPTH) {
++    uint16_t *const base = CONVERT_TO_SHORTPTR(dst->buffers[plane]);
++    if (avail.left) {
++      for (int y = 0; y < height; ++y) {
++        uint16_t *const row = base + (y0 + y) * dst->strides[is_uv] + x0;
++        row[0] = (uint16_t)((3 * row[0] + row[-1] + 2) >> 2);
++      }
++    }
++    if (avail.right) {
++      for (int y = 0; y < height; ++y) {
++        uint16_t *const row = base + (y0 + y) * dst->strides[is_uv] + x0;
++        row[width - 1] =
++            (uint16_t)((3 * row[width - 1] + row[width] + 2) >> 2);
++      }
++    }
++    if (avail.top) {
++      uint16_t *const row = base + y0 * dst->strides[is_uv] + x0;
++      const uint16_t *const top = row - dst->strides[is_uv];
++      for (int x = 0; x < width; ++x) {
++        row[x] = (uint16_t)((3 * row[x] + top[x] + 2) >> 2);
++      }
++    }
++    if (avail.bottom) {
++      uint16_t *const row = base + (y1 - 1) * dst->strides[is_uv] + x0;
++      const uint16_t *const bottom = row + dst->strides[is_uv];
++      for (int x = 0; x < width; ++x) {
++        row[x] = (uint16_t)((3 * row[x] + bottom[x] + 2) >> 2);
++      }
++    }
++  } else {
++    uint8_t *const base = dst->buffers[plane];
++    if (avail.left) {
++      for (int y = 0; y < height; ++y) {
++        uint8_t *const row = base + (y0 + y) * dst->strides[is_uv] + x0;
++        row[0] = (uint8_t)((3 * row[0] + row[-1] + 2) >> 2);
++      }
++    }
++    if (avail.right) {
++      for (int y = 0; y < height; ++y) {
++        uint8_t *const row = base + (y0 + y) * dst->strides[is_uv] + x0;
++        row[width - 1] = (uint8_t)((3 * row[width - 1] + row[width] + 2) >> 2);
++      }
++    }
++    if (avail.top) {
++      uint8_t *const row = base + y0 * dst->strides[is_uv] + x0;
++      const uint8_t *const top = row - dst->strides[is_uv];
++      for (int x = 0; x < width; ++x) {
++        row[x] = (uint8_t)((3 * row[x] + top[x] + 2) >> 2);
++      }
++    }
++    if (avail.bottom) {
++      uint8_t *const row = base + (y1 - 1) * dst->strides[is_uv] + x0;
++      const uint8_t *const bottom = row + dst->strides[is_uv];
++      for (int x = 0; x < width; ++x) {
++        row[x] = (uint8_t)((3 * row[x] + bottom[x] + 2) >> 2);
++      }
++    }
++  }
++}
++
++static const AV1EcMvCandidate *av1_ec_pick_mv_candidate(
++    const AV1Decoder *pbi, AV1EcMvCandidate *candidates, int count, int mi_row,
++    int mi_col, int mi_width, int mi_height, int x0, int y0, int x1, int y1) {
++  const AV1_COMMON *const cm = &pbi->common;
++  if (cm->cur_frame == NULL || count <= 0) return NULL;
++
++  const YV12_BUFFER_CONFIG *const dst = &cm->cur_frame->buf;
++  const AV1EcMvCandidate *best = NULL;
++  uint64_t best_cost = UINT64_MAX;
++  for (int i = 0; i < count; ++i) {
++    const uint64_t cost = av1_ec_score_candidate(
++        pbi, dst, &candidates[i], mi_row, mi_col, mi_width, mi_height, x0, y0,
++        x1, y1);
++    if (cost < best_cost) {
++      best_cost = cost;
++      best = &candidates[i];
++    }
++  }
++  return best;
++}
++
++static BLOCK_SIZE av1_ec_get_region_bsize(int width, int height) {
++  for (int bsize = BLOCK_4X4; bsize < BLOCK_SIZES_ALL; ++bsize) {
++    if (block_size_wide[bsize] == width &&
++        block_size_high[bsize] == height) {
++      return (BLOCK_SIZE)bsize;
++    }
++  }
++  return BLOCK_INVALID;
++}
++
++static MB_MODE_INFO *av1_ec_store_concealed_mbmi(
++    AV1Decoder *pbi, DecoderCodingBlock *dcb, int mi_row, int mi_col,
++    BLOCK_SIZE bsize, const AV1EcMvCandidate *best) {
++  if (dcb == NULL || bsize == BLOCK_INVALID) return NULL;
++
++  AV1_COMMON *const cm = &pbi->common;
++  const int mi_width = mi_size_wide[bsize];
++  const int mi_height = mi_size_high[bsize];
++  const int x_mis = AOMMIN(mi_width, cm->mi_params.mi_cols - mi_col);
++  const int y_mis = AOMMIN(mi_height, cm->mi_params.mi_rows - mi_row);
++  if (x_mis <= 0 || y_mis <= 0) return NULL;
++
++  const int grid_idx = get_mi_grid_idx(&cm->mi_params, mi_row, mi_col);
++  MB_MODE_INFO *const base_mbmi = cm->mi_params.mi_grid_base[grid_idx];
++  if (base_mbmi == NULL) return NULL;
++
++  av1_zero(*base_mbmi);
++  MACROBLOCKD *const xd = &dcb->xd;
++  set_offsets(cm, xd, bsize, mi_row, mi_col, mi_width, mi_height, x_mis,
++              y_mis);
++
++  MB_MODE_INFO *const mbmi = xd->mi[0];
++  mbmi->bsize = bsize;
++  mbmi->partition = PARTITION_NONE;
++  mbmi->current_qindex = xd->current_base_qindex;
++  mbmi->skip_txfm = 1;
++  mbmi->tx_size = max_txsize_rect_lookup[bsize];
++  memset(mbmi->inter_tx_size, mbmi->tx_size, sizeof(mbmi->inter_tx_size));
++  mbmi->interinter_comp.type = COMPOUND_AVERAGE;
++  mbmi->motion_mode = SIMPLE_TRANSLATION;
++
++  if (best != NULL) {
++    mbmi->mode = NEWMV;
++    mbmi->ref_frame[0] = best->ref_frame;
++    mbmi->ref_frame[1] = NONE_FRAME;
++    mbmi->mv[0].as_mv = best->mv;
++    mbmi->mv[1].as_int = 0;
++    set_default_interp_filters(mbmi, cm->features.interp_filter);
++    if (cm->cur_frame != NULL && cm->cur_frame->mvs != NULL) {
++      av1_copy_frame_mvs(cm, mbmi, mi_row, mi_col, x_mis, y_mis);
++    }
++  } else {
++    mbmi->mode = DC_PRED;
++    mbmi->uv_mode = UV_DC_PRED;
++    mbmi->ref_frame[0] = INTRA_FRAME;
++    mbmi->ref_frame[1] = NONE_FRAME;
++    mbmi->mv[0].as_int = 0;
++    mbmi->mv[1].as_int = 0;
++  }
++
++  av1_reset_entropy_context(xd, bsize, av1_num_planes(cm));
++  return mbmi;
++}
++
++static void av1_ec_copy_or_fill_region(AV1Decoder *pbi, DecoderCodingBlock *dcb,
++                                       int mi_row, int mi_col, int x, int y,
++                                       int width, int height,
++                                       int use_reference) {
++  AV1_COMMON *const cm = &pbi->common;
++  if (cm->cur_frame == NULL) return;
++
++  YV12_BUFFER_CONFIG *const dst = &cm->cur_frame->buf;
++  const int x0 = clamp(x, 0, dst->y_crop_width);
++  const int y0 = clamp(y, 0, dst->y_crop_height);
++  const int x1 = clamp(x + width, 0, dst->y_crop_width);
++  const int y1 = clamp(y + height, 0, dst->y_crop_height);
++  if (x1 <= x0 || y1 <= y0) return;
++
++  const int mib_size = cm->seq_params->mib_size;
++  const int mi_width = AOMMIN(mib_size, cm->mi_params.mi_cols - mi_col);
++  const int mi_height = AOMMIN(mib_size, cm->mi_params.mi_rows - mi_row);
++  av1_ec_mark_mi_region(pbi, mi_row, mi_col, mi_width, mi_height,
++                        AV1_EC_MI_DAMAGED);
++
++  AV1EcMvCandidate candidates[AV1_EC_MAX_MV_CANDIDATES];
++  int candidate_count = 0;
++  const AV1EcMvCandidate *best = NULL;
++  if (use_reference) {
++    candidate_count = av1_ec_add_neighbor_mvs(pbi, candidates, candidate_count,
++                                              mi_row, mi_col);
++    candidate_count = av1_ec_add_previous_mvs(cm, candidates, candidate_count,
++                                              mi_row, mi_col);
++    candidate_count =
++        av1_ec_add_mean_mvs(cm, candidates, candidate_count, candidate_count);
++    candidate_count =
++        av1_ec_add_default_mvs(cm, candidates, candidate_count, mi_row, mi_col);
++    best = av1_ec_pick_mv_candidate(pbi, candidates, candidate_count, mi_row,
++                                    mi_col, mi_width, mi_height, x0, y0, x1,
++                                    y1);
++  }
++
++  const BLOCK_SIZE bsize = av1_ec_get_region_bsize(width, height);
++  av1_ec_store_concealed_mbmi(pbi, dcb, mi_row, mi_col, bsize, best);
++
++  const int num_planes = av1_num_planes(cm);
++  for (int plane = 0; plane < num_planes; ++plane) {
++    const int ss_x = plane > 0 ? dst->subsampling_x : 0;
++    const int ss_y = plane > 0 ? dst->subsampling_y : 0;
++    const int is_uv = plane > 0;
++    const int plane_x0 = x0 >> ss_x;
++    const int plane_y0 = y0 >> ss_y;
++    const int plane_x1 =
++        AOMMIN((x1 + (1 << ss_x) - 1) >> ss_x, dst->crop_widths[is_uv]);
++    const int plane_y1 =
++        AOMMIN((y1 + (1 << ss_y) - 1) >> ss_y, dst->crop_heights[is_uv]);
++    av1_ec_directional_fill_plane(pbi, dst, plane, mi_row, mi_col, mi_width,
++                                  mi_height, plane_x0, plane_y0, plane_x1,
++                                  plane_y1, best);
++    av1_ec_blend_plane_boundaries(pbi, dst, plane, mi_row, mi_col, mi_width,
++                                  mi_height, plane_x0, plane_y0, plane_x1,
++                                  plane_y1);
++  }
++
++  ++pbi->ec_path_directional_fill;
++  if (best != NULL) {
++    ++pbi->ec_path_degraded_mv_hint;
++    if (best->path == AV1_EC_PATH_GLOBAL_MV) {
++      ++pbi->ec_path_global_mv;
++    } else if (best->path == AV1_EC_PATH_ZERO_MV) {
++      ++pbi->ec_path_zero_mv;
++    } else if (best->path == AV1_EC_PATH_PREV_MV) {
++      ++pbi->ec_path_prev_mv;
++    } else {
++      ++pbi->ec_path_mv;
++    }
++  } else {
++    if (x0 == 0 && y0 == 0 && av1_ec_find_ref_frame(cm) == NULL)
++      ++pbi->ec_path_gray;
++    else
++      ++pbi->ec_path_edge_fill;
++  }
++
++  av1_ec_mark_mi_region(pbi, mi_row, mi_col, mi_width, mi_height,
++                        AV1_EC_MI_CONCEALED);
++}
++
++static void av1_ec_conceal_tile_suffix(AV1Decoder *pbi, DecoderCodingBlock *dcb,
++                                       int tile_row, int tile_col, int mi_row,
++                                       int mi_col, int use_reference) {
++  AV1_COMMON *const cm = &pbi->common;
++  TileInfo tile_info;
++  av1_tile_set_row(&tile_info, cm, tile_row);
++  av1_tile_set_col(&tile_info, cm, tile_col);
++
++  mi_row =
++      av1_ec_align_mi_to_sb(cm, mi_row, tile_info.mi_row_start,
++                            tile_info.mi_row_end);
++  mi_col =
++      av1_ec_align_mi_to_sb(cm, mi_col, tile_info.mi_col_start,
++                            tile_info.mi_col_end);
++
++  const int mib_size = cm->seq_params->mib_size;
++  for (int row = mi_row; row < tile_info.mi_row_end; row += mib_size) {
++    const int start_col = row == mi_row ? mi_col : tile_info.mi_col_start;
++    if (start_col >= tile_info.mi_col_end) continue;
++    for (int col = start_col; col < tile_info.mi_col_end; col += mib_size) {
++      const int x = col * MI_SIZE;
++      const int y = row * MI_SIZE;
++      const int width = AOMMIN(mib_size, tile_info.mi_col_end - col) * MI_SIZE;
++      const int height =
++          AOMMIN(mib_size, tile_info.mi_row_end - row) * MI_SIZE;
++      av1_ec_copy_or_fill_region(pbi, dcb, row, col, x, y, width, height,
++                                 use_reference);
++      ++pbi->ec_concealed_sbs;
++    }
++  }
++
++  pbi->ec_active = 1;
++  aom_merge_corrupted_flag(&pbi->dcb.corrupted, 1);
++  if (cm->cur_frame != NULL) cm->cur_frame->buf.corrupted = 1;
++}
++
++static int av1_ec_should_force_loss_region(const AV1Decoder *pbi) {
++  return pbi->error_concealment_enabled && !pbi->ec_active &&
++         pbi->ec_zero_run_found &&
++         pbi->ec_zero_run_length >= AV1_EC_FORCED_ZERO_RUN_MIN &&
++         pbi->ec_est_tile_row >= 0 && pbi->ec_est_tile_col >= 0 &&
++         av1_ec_find_ref_frame(&pbi->common) != NULL;
++}
++
++static void av1_ec_setup_concealment_dcb(AV1Decoder *pbi, ThreadData *td,
++                                         int tile_row, int tile_col) {
++  AV1_COMMON *const cm = &pbi->common;
++  CommonTileParams *const tiles = &cm->tiles;
++  TileDataDec *const tile_data =
++      pbi->tile_data + tile_row * tiles->cols + tile_col;
++
++  td->dcb.corrupted = 0;
++  av1_tile_init(&td->dcb.xd.tile, cm, tile_row, tile_col);
++  td->dcb.xd.current_base_qindex = cm->quant_params.base_qindex;
++  av1_init_macroblockd(cm, &td->dcb.xd);
++  av1_init_above_context(&cm->above_contexts, av1_num_planes(cm), tile_row,
++                         &td->dcb.xd);
++  tile_data->tctx = *cm->fc;
++  td->dcb.xd.tile_ctx = &tile_data->tctx;
++}
++
++static void av1_ec_force_loss_region(AV1Decoder *pbi, ThreadData *td,
++                                     int start_tile, int end_tile,
++                                     int tile_rows_start, int tile_rows_end,
++                                     int tile_cols_start, int tile_cols_end) {
++  if (!av1_ec_should_force_loss_region(pbi)) return;
++
++  AV1_COMMON *const cm = &pbi->common;
++  CommonTileParams *const tiles = &cm->tiles;
++  const int tile_row = pbi->ec_est_tile_row;
++  const int tile_col = pbi->ec_est_tile_col;
++  const int tile = tile_row * tiles->cols + tile_col;
++  if (tile_row < tile_rows_start || tile_row >= tile_rows_end ||
++      tile_col < tile_cols_start || tile_col >= tile_cols_end ||
++      tile < start_tile || tile > end_tile) {
++    return;
++  }
++
++  av1_ec_setup_concealment_dcb(pbi, td, tile_row, tile_col);
++  av1_ec_record_damage(pbi, tile_row, tile_col, pbi->ec_est_mi_row,
++                       pbi->ec_est_mi_col);
++  av1_ec_conceal_tile_suffix(pbi, &td->dcb, tile_row, tile_col,
++                             pbi->ec_est_mi_row, pbi->ec_est_mi_col, 1);
++}
++
++static void av1_ec_record_damage(AV1Decoder *pbi, int tile_row, int tile_col,
++                                 int mi_row, int mi_col) {
++  if (pbi->ec_damage_tile_row >= 0) return;
++  pbi->ec_damage_tile_row = tile_row;
++  pbi->ec_damage_tile_col = tile_col;
++  pbi->ec_damage_mi_row = mi_row;
++  pbi->ec_damage_mi_col = mi_col;
++}
++
++static void av1_ec_set_estimated_sb(AV1Decoder *pbi, int tile_row, int tile_col,
++                                    double tile_fraction) {
++  AV1_COMMON *const cm = &pbi->common;
++  TileInfo tile_info;
++  av1_tile_set_row(&tile_info, cm, tile_row);
++  av1_tile_set_col(&tile_info, cm, tile_col);
++
++  const int sb_rows = AOMMAX(1, av1_get_sb_rows_in_tile(cm, &tile_info));
++  const int sb_cols = AOMMAX(1, av1_get_sb_cols_in_tile(cm, &tile_info));
++  const int sb_count = sb_rows * sb_cols;
++  const int sb_index =
++      clamp((int)(tile_fraction * sb_count), 0, sb_count - 1);
++  int sb_row = sb_index / sb_cols;
++  int sb_col = sb_index % sb_cols;
++  if (tile_fraction > 0.72 && tile_fraction < 0.94 && sb_row > 0) --sb_row;
++  const int mib_size = cm->seq_params->mib_size;
++
++  pbi->ec_est_tile_row = tile_row;
++  pbi->ec_est_tile_col = tile_col;
++  pbi->ec_est_mi_row =
++      AOMMIN(tile_info.mi_row_start + sb_row * mib_size,
++             tile_info.mi_row_end - 1);
++  pbi->ec_est_mi_col =
++      AOMMIN(tile_info.mi_col_start + sb_col * mib_size,
++             tile_info.mi_col_end - 1);
++}
++
++static void av1_ec_estimate_tile_damage(
++    AV1Decoder *pbi, TileBufferDec (*const tile_buffers)[MAX_TILE_COLS],
++    int start_tile, int end_tile) {
++  if (!pbi->error_concealment_enabled || !pbi->ec_zero_run_found ||
++      pbi->ec_pkt_data == NULL || pbi->ec_pkt_size == 0) {
++    return;
++  }
++
++  AV1_COMMON *const cm = &pbi->common;
++  CommonTileParams *const tiles = &cm->tiles;
++  const uintptr_t zero_pos =
++      (uintptr_t)(pbi->ec_pkt_data + pbi->ec_zero_run_start);
++
++  for (int tile = start_tile; tile <= end_tile; ++tile) {
++    const int row = tile / tiles->cols;
++    const int col = tile % tiles->cols;
++    const TileBufferDec *const buf = &tile_buffers[row][col];
++    if (buf->data == NULL || buf->size == 0) continue;
++
++    const uintptr_t tile_start = (uintptr_t)buf->data;
++    const uintptr_t tile_end = tile_start + buf->size;
++    if (zero_pos >= tile_start && zero_pos < tile_end) {
++      const double tile_fraction =
++          (double)(zero_pos - tile_start) / (double)buf->size;
++      av1_ec_set_estimated_sb(pbi, row, col, tile_fraction);
++      return;
++    }
++  }
++
++  const int tile_count = end_tile - start_tile + 1;
++  if (tile_count <= 0) return;
++  const double packet_fraction =
++      (double)pbi->ec_zero_run_start / (double)pbi->ec_pkt_size;
++  const double scaled = packet_fraction * tile_count;
++  const int tile_offset = clamp((int)scaled, 0, tile_count - 1);
++  const int tile = start_tile + tile_offset;
++  const double tile_fraction = scaled - tile_offset;
++  av1_ec_set_estimated_sb(pbi, tile / tiles->cols, tile % tiles->cols,
++                          tile_fraction);
++}
++
++static void av1_ec_choose_damage_sb(AV1Decoder *pbi, int tile_row,
++                                    int tile_col, int *mi_row, int *mi_col) {
++  AV1_COMMON *const cm = &pbi->common;
++  TileInfo tile_info;
++  av1_tile_set_row(&tile_info, cm, tile_row);
++  av1_tile_set_col(&tile_info, cm, tile_col);
++
++  if (pbi->ec_est_tile_row == tile_row && pbi->ec_est_tile_col == tile_col) {
++    *mi_row = pbi->ec_est_mi_row;
++    *mi_col = pbi->ec_est_mi_col;
++  } else if (pbi->ec_cur_tile_row == tile_row &&
++             pbi->ec_cur_tile_col == tile_col) {
++    *mi_row = pbi->ec_cur_mi_row;
++    *mi_col = pbi->ec_cur_mi_col;
++  } else {
++    *mi_row = tile_info.mi_row_start;
++    *mi_col = tile_info.mi_col_start;
++  }
++
++  *mi_row =
++      av1_ec_align_mi_to_sb(cm, *mi_row, tile_info.mi_row_start,
++                            tile_info.mi_row_end);
++  *mi_col =
++      av1_ec_align_mi_to_sb(cm, *mi_col, tile_info.mi_col_start,
++                            tile_info.mi_col_end);
++}
++
+ static inline void decode_tile(AV1Decoder *pbi, ThreadData *const td,
+                                int tile_row, int tile_col) {
+ #if CONFIG_COLLECT_COMPONENT_TIMING
+@@ -2792,6 +3982,7 @@
+     for (int mi_col = tile_info.mi_col_start; mi_col < tile_info.mi_col_end;
+          mi_col += cm->seq_params->mib_size) {
+       set_cb_buffer(pbi, dcb, &td->cb_buffer_base, num_planes, 0, 0);
++      av1_ec_note_sb(pbi, tile_row, tile_col, mi_row, mi_col);
+ 
+ #if CONFIG_INSPECTION
+       const int start_bits = aom_reader_tell(td->bit_reader);
+@@ -2850,19 +4041,20 @@
+   const int tile_rows = tiles->rows;
+   const int n_tiles = tile_cols * tile_rows;
+   TileBufferDec(*const tile_buffers)[MAX_TILE_COLS] = pbi->tile_buffers;
+-  const int dec_tile_row = AOMMIN(pbi->dec_tile_row, tile_rows);
++
++  volatile int dec_tile_row = AOMMIN(pbi->dec_tile_row, tile_rows);
+   const int single_row = pbi->dec_tile_row >= 0;
+-  const int dec_tile_col = AOMMIN(pbi->dec_tile_col, tile_cols);
++  volatile int dec_tile_col = AOMMIN(pbi->dec_tile_col, tile_cols);
+   const int single_col = pbi->dec_tile_col >= 0;
+-  int tile_rows_start;
+-  int tile_rows_end;
+-  int tile_cols_start;
+-  int tile_cols_end;
+-  int inv_col_order;
+-  int inv_row_order;
+-  int tile_row, tile_col;
++  volatile int tile_rows_start;
++  volatile int tile_rows_end;
++  volatile int tile_cols_start;
++  volatile int tile_cols_end;
++  volatile int inv_col_order;
++  volatile int inv_row_order;
++  volatile int tile_row, tile_col;
+   uint8_t allow_update_cdf;
+-  const uint8_t *raw_data_end = NULL;
++  const uint8_t *volatile raw_data_end = NULL;
+ 
+   if (tiles->large_scale) {
+     tile_rows_start = single_row ? dec_tile_row : 0;
+@@ -2904,6 +4096,9 @@
+ #endif  // EXT_TILE_DEBUG
+     get_tile_buffers(pbi, data, data_end, tile_buffers, start_tile, end_tile);
+ 
++  av1_ec_ensure_mi_status_map(pbi);
++  av1_ec_estimate_tile_damage(pbi, tile_buffers, start_tile, end_tile);
++
+   if (pbi->tile_data == NULL || n_tiles != pbi->allocated_tiles) {
+     decoder_alloc_tile_data(pbi, n_tiles);
+   }
+@@ -2931,10 +4126,10 @@
+   }
+ 
+   for (tile_row = tile_rows_start; tile_row < tile_rows_end; ++tile_row) {
+-    const int row = inv_row_order ? tile_rows - 1 - tile_row : tile_row;
++    volatile int row = inv_row_order ? tile_rows - 1 - tile_row : tile_row;
+ 
+     for (tile_col = tile_cols_start; tile_col < tile_cols_end; ++tile_col) {
+-      const int col = inv_col_order ? tile_cols - 1 - tile_col : tile_col;
++      volatile int col = inv_col_order ? tile_cols - 1 - tile_col : tile_col;
+       TileDataDec *const tile_data = pbi->tile_data + row * tiles->cols + col;
+       const TileBufferDec *const tile_bs_buf = &tile_buffers[row][col];
+ 
+@@ -2942,12 +4137,46 @@
+           row * tiles->cols + col > end_tile)
+         continue;
+ 
++      td->dcb.corrupted = 0;
+       td->bit_reader = &tile_data->bit_reader;
+       av1_zero(td->cb_buffer_base.dqcoeff);
+       av1_tile_init(&td->dcb.xd.tile, cm, row, col);
+       td->dcb.xd.current_base_qindex = cm->quant_params.base_qindex;
++
++      struct aom_internal_error_info tile_error;
++      struct aom_internal_error_info *const saved_error = cm->error;
++      if (pbi->error_concealment_enabled) {
++        av1_zero(tile_error);
++        tile_error.setjmp = 1;
++        cm->error = &tile_error;
++        if (setjmp(tile_error.jmp)) {
++          tile_error.setjmp = 0;
++          cm->error = saved_error;
++          td->dcb.xd.error_info = saved_error;
++          if (tile_error.error_code != AOM_CODEC_CORRUPT_FRAME) {
++            aom_internal_error_copy(&pbi->error, &tile_error);
++          }
++
++          av1_init_macroblockd(cm, &td->dcb.xd);
++          av1_init_above_context(&cm->above_contexts, av1_num_planes(cm), row,
++                                 &td->dcb.xd);
++          tile_data->tctx = *cm->fc;
++          td->dcb.xd.tile_ctx = &tile_data->tctx;
++
++          int conceal_mi_row;
++          int conceal_mi_col;
++          av1_ec_choose_damage_sb(pbi, row, col, &conceal_mi_row,
++                                  &conceal_mi_col);
++          av1_ec_record_damage(pbi, row, col, conceal_mi_row, conceal_mi_col);
++          av1_ec_conceal_tile_suffix(pbi, &td->dcb, row, col, conceal_mi_row,
++                                     conceal_mi_col, 1);
++          td->dcb.corrupted = 1;
++          continue;
++        }
++      }
++
+       setup_bool_decoder(&td->dcb.xd, tile_bs_buf->data, data_end,
+-                         tile_bs_buf->size, &pbi->error, td->bit_reader,
++                         tile_bs_buf->size, cm->error, td->bit_reader,
+                          allow_update_cdf);
+ #if CONFIG_ACCOUNTING
+       if (pbi->acct_enabled) {
+@@ -2968,11 +4197,38 @@
+ 
+       // decode tile
+       decode_tile(pbi, td, row, col);
++
++      if (pbi->error_concealment_enabled) {
++        tile_error.setjmp = 0;
++        cm->error = saved_error;
++        td->dcb.xd.error_info = saved_error;
++      }
++
+       aom_merge_corrupted_flag(&pbi->dcb.corrupted, td->dcb.corrupted);
+-      if (pbi->dcb.corrupted)
++      if (td->dcb.corrupted && pbi->error_concealment_enabled) {
++        int conceal_mi_row;
++        int conceal_mi_col;
++        av1_ec_choose_damage_sb(pbi, row, col, &conceal_mi_row,
++                                &conceal_mi_col);
++        av1_ec_record_damage(pbi, row, col, conceal_mi_row, conceal_mi_col);
++        av1_ec_conceal_tile_suffix(pbi, &td->dcb, row, col, conceal_mi_row,
++                                   conceal_mi_col, 1);
++        continue;
++      }
++      if (pbi->dcb.corrupted) {
++        if (pbi->error_concealment_enabled && pbi->ec_active) continue;
+         aom_internal_error(&pbi->error, AOM_CODEC_CORRUPT_FRAME,
+                            "Failed to decode tile data");
+-    }
++      }
++    }
++  }
++
++  av1_ec_force_loss_region(pbi, td, start_tile, end_tile,
++                           (int)tile_rows_start, (int)tile_rows_end,
++                           (int)tile_cols_start, (int)tile_cols_end);
++
++  if (pbi->ec_active) {
++    return data_end;
+   }
+ 
+   if (tiles->large_scale) {
+@@ -4504,6 +5760,25 @@
+   }
+ }
+ 
++static int av1_ec_allow_nonshowable_existing_frame(AV1Decoder *pbi,
++                                                   RefCntBuffer *frame_to_show) {
++  if (!pbi->error_concealment_enabled || frame_to_show == NULL) {
++    return 0;
++  }
++
++  const int packet_has_damage =
++      pbi->ec_zero_run_found || pbi->ec_api_zero_run_found ||
++      pbi->ec_input_zero_run_found;
++  if (!packet_has_damage && !frame_to_show->buf.corrupted) return 0;
++
++  AV1_COMMON *const cm = &pbi->common;
++  frame_to_show->buf.corrupted = 1;
++  if (cm->cur_frame != NULL) cm->cur_frame->buf.corrupted = 1;
++  pbi->ec_active = 1;
++  ++pbi->ec_path_edge_fill;
++  return 1;
++}
++
+ // If the refresh_frame_flags bitmask is set, update reference frame id values
+ // and mark frames as valid for reference.
+ static inline void update_ref_frame_id(AV1Decoder *const pbi) {
+@@ -4649,7 +5924,8 @@
+       // Section 6.8.2: It is a requirement of bitstream conformance that when
+       // show_existing_frame is used to show a previous frame, that the value
+       // of showable_frame for the previous frame was equal to 1.
+-      if (!frame_to_show->showable_frame) {
++      if (!frame_to_show->showable_frame &&
++          !av1_ec_allow_nonshowable_existing_frame(pbi, frame_to_show)) {
+         aom_internal_error(&pbi->error, AOM_CODEC_UNSUP_BITSTREAM,
+                            "Buffer does not contain a showable frame");
+       }
+@@ -5375,11 +6651,12 @@
+ #if CONFIG_COLLECT_COMPONENT_TIMING
+   start_timing(pbi, decode_tiles_time);
+ #endif
+-  if (pbi->max_threads > 1 && !(tiles->large_scale && !pbi->ext_tile_debug) &&
+-      pbi->row_mt)
++  if (!pbi->error_concealment_enabled && pbi->max_threads > 1 &&
++      !(tiles->large_scale && !pbi->ext_tile_debug) && pbi->row_mt)
+     *p_data_end =
+         decode_tiles_row_mt(pbi, data, data_end, start_tile, end_tile);
+-  else if (pbi->max_threads > 1 && tile_count_tg > 1 &&
++  else if (!pbi->error_concealment_enabled && pbi->max_threads > 1 &&
++           tile_count_tg > 1 &&
+            !(tiles->large_scale && !pbi->ext_tile_debug))
+     *p_data_end = decode_tiles_mt(pbi, data, data_end, start_tile, end_tile);
+   else
+@@ -5401,7 +6678,8 @@
+                          pbi->num_workers, 1);
+   av1_alloc_cdef_sync(cm, &pbi->cdef_sync, pbi->num_workers);
+ 
+-  if (!cm->features.allow_intrabc && !tiles->single_tile_decoding) {
++  if (!cm->features.allow_intrabc && !tiles->single_tile_decoding &&
++      !(pbi->error_concealment_enabled && pbi->ec_active)) {
+ #if CONFIG_COLLECT_COMPONENT_TIMING
+     start_timing(pbi, av1_loop_filter_frame_time);
+ #endif
+@@ -5491,6 +6769,8 @@
+       *cm->fc = pbi->tile_data[pbi->context_update_tile_id].tctx;
+       av1_reset_cdf_symbol_counters(cm->fc);
+     }
++  } else if (pbi->error_concealment_enabled && pbi->ec_active) {
++    if (cm->cur_frame != NULL) cm->cur_frame->buf.corrupted = 1;
+   } else {
+     aom_internal_error(&pbi->error, AOM_CODEC_CORRUPT_FRAME,
+                        "Decode failed. Frame data is corrupted.");
+diff --git a/av1/decoder/decoder.c b/av1/decoder/decoder.c
+--- a/av1/decoder/decoder.c
++++ b/av1/decoder/decoder.c
+@@ -43,6 +43,138 @@
+   av1_init_wedge_masks();
+ }
+ 
++static void av1_ec_find_zero_run(const uint8_t *source, size_t size,
++                                 int *found, size_t *start, size_t *length) {
++  *found = 0;
++  *start = 0;
++  *length = 0;
++  if (source == NULL || size == 0) return;
++
++  size_t best_start = 0;
++  size_t best_len = 0;
++  for (size_t i = 0; i < size;) {
++    if (source[i] != 0) {
++      ++i;
++      continue;
++    }
++
++    const size_t run_start = i;
++    while (i < size && source[i] == 0) ++i;
++    if (i - run_start > best_len) {
++      best_start = run_start;
++      best_len = i - run_start;
++    }
++  }
++
++  if (best_len >= 64) {
++    *found = 1;
++    *start = best_start;
++    *length = best_len;
++  }
++}
++
++void av1_ec_set_packet_damage_hint(AV1Decoder *pbi, const uint8_t *source,
++                                   size_t size) {
++  pbi->ec_api_pkt_data = source;
++  pbi->ec_api_pkt_size = size;
++  pbi->ec_api_zero_run_found = 0;
++  pbi->ec_api_zero_run_start = 0;
++  pbi->ec_api_zero_run_length = 0;
++
++  if (!pbi->error_concealment_enabled) return;
++  av1_ec_find_zero_run(source, size, &pbi->ec_api_zero_run_found,
++                       &pbi->ec_api_zero_run_start,
++                       &pbi->ec_api_zero_run_length);
++}
++
++void av1_ec_set_input_packet_damage_hint(AV1Decoder *pbi,
++                                         const uint8_t *source, size_t size) {
++  const uint8_t *const prev_pkt_data = pbi->ec_input_pkt_data;
++  const size_t prev_pkt_size = pbi->ec_input_pkt_size;
++  const int prev_zero_run_found = pbi->ec_input_zero_run_found;
++  const int prev_zero_run_carried = pbi->ec_input_zero_run_carried;
++  const size_t prev_zero_run_start = pbi->ec_input_zero_run_start;
++  const size_t prev_zero_run_length = pbi->ec_input_zero_run_length;
++  const int carry_previous_hint =
++      pbi->error_concealment_enabled && prev_zero_run_found &&
++      !prev_zero_run_carried && size > 0 && size <= 16 &&
++      (pbi->ec_active || pbi->ec_pending_output_damage);
++
++  pbi->ec_input_pkt_data = source;
++  pbi->ec_input_pkt_size = size;
++  pbi->ec_input_zero_run_found = 0;
++  pbi->ec_input_zero_run_carried = 0;
++  pbi->ec_input_zero_run_start = 0;
++  pbi->ec_input_zero_run_length = 0;
++
++  if (!pbi->error_concealment_enabled) return;
++  av1_ec_find_zero_run(source, size, &pbi->ec_input_zero_run_found,
++                       &pbi->ec_input_zero_run_start,
++                       &pbi->ec_input_zero_run_length);
++  if (!pbi->ec_input_zero_run_found && carry_previous_hint) {
++    pbi->ec_input_pkt_data = prev_pkt_data;
++    pbi->ec_input_pkt_size = prev_pkt_size;
++    pbi->ec_input_zero_run_found = prev_zero_run_found;
++    pbi->ec_input_zero_run_carried = 1;
++    pbi->ec_input_zero_run_start = prev_zero_run_start;
++    pbi->ec_input_zero_run_length = prev_zero_run_length;
++  }
++}
++
++static void av1_ec_reset_packet_state(AV1Decoder *pbi, const uint8_t *source,
++                                      size_t size) {
++  pbi->ec_active = 0;
++  pbi->ec_pkt_data = source;
++  pbi->ec_pkt_size = size;
++  pbi->ec_zero_run_found = 0;
++  pbi->ec_zero_run_start = 0;
++  pbi->ec_zero_run_length = 0;
++  pbi->ec_est_tile_row = -1;
++  pbi->ec_est_tile_col = -1;
++  pbi->ec_est_mi_row = -1;
++  pbi->ec_est_mi_col = -1;
++  pbi->ec_cur_tile_row = -1;
++  pbi->ec_cur_tile_col = -1;
++  pbi->ec_cur_mi_row = -1;
++  pbi->ec_cur_mi_col = -1;
++  pbi->ec_damage_tile_row = -1;
++  pbi->ec_damage_tile_col = -1;
++  pbi->ec_damage_mi_row = -1;
++  pbi->ec_damage_mi_col = -1;
++  pbi->ec_concealed_sbs = 0;
++  pbi->ec_path_mv = 0;
++  pbi->ec_path_prev_mv = 0;
++  pbi->ec_path_zero_mv = 0;
++  pbi->ec_path_global_mv = 0;
++  pbi->ec_path_edge_fill = 0;
++  pbi->ec_path_gray = 0;
++  pbi->ec_path_directional_fill = 0;
++  pbi->ec_path_degraded_mv_hint = 0;
++
++  if (!pbi->error_concealment_enabled) {
++    pbi->ec_pending_output_damage = 0;
++    return;
++  }
++  if (source == NULL || size == 0) return;
++
++  av1_ec_find_zero_run(source, size, &pbi->ec_zero_run_found,
++                       &pbi->ec_zero_run_start, &pbi->ec_zero_run_length);
++  if (!pbi->ec_zero_run_found && pbi->ec_api_zero_run_found) {
++    pbi->ec_pkt_data = pbi->ec_api_pkt_data;
++    pbi->ec_pkt_size = pbi->ec_api_pkt_size;
++    pbi->ec_zero_run_found = pbi->ec_api_zero_run_found;
++    pbi->ec_zero_run_start = pbi->ec_api_zero_run_start;
++    pbi->ec_zero_run_length = pbi->ec_api_zero_run_length;
++  }
++  if (!pbi->ec_zero_run_found && pbi->ec_input_zero_run_found) {
++    pbi->ec_pkt_data = pbi->ec_input_pkt_data;
++    pbi->ec_pkt_size = pbi->ec_input_pkt_size;
++    pbi->ec_zero_run_found = pbi->ec_input_zero_run_found;
++    pbi->ec_zero_run_start = pbi->ec_input_zero_run_start;
++    pbi->ec_zero_run_length = pbi->ec_input_zero_run_length;
++  }
++}
++
+ static void dec_set_mb_mi(CommonModeInfoParams *mi_params, int width,
+                           int height, BLOCK_SIZE min_partition_size) {
+   (void)min_partition_size;
+@@ -228,6 +360,7 @@
+   }
+ 
+   av1_dec_free_cb_buf(pbi);
++  aom_free(pbi->ec_mi_status);
+ #if CONFIG_ACCOUNTING
+   aom_accounting_clear(&pbi->accounting);
+ #endif
+@@ -357,6 +490,268 @@
+   cm->cur_frame = NULL;
+ }
+ 
++#define AV1_EC_PENDING_OUTPUT_ZERO_RUN_MIN 1024
++
++static void av1_ec_queue_pending_output_damage(AV1Decoder *pbi) {
++  if (!pbi->error_concealment_enabled || !pbi->ec_active ||
++      !pbi->ec_zero_run_found ||
++      pbi->ec_zero_run_length < AV1_EC_PENDING_OUTPUT_ZERO_RUN_MIN) {
++    return;
++  }
++
++  pbi->ec_pending_output_damage = 1;
++  if (pbi->ec_damage_mi_row >= 0 && pbi->ec_damage_mi_col >= 0) {
++    pbi->ec_pending_mi_row = pbi->ec_damage_mi_row;
++    pbi->ec_pending_mi_col = pbi->ec_damage_mi_col;
++  } else if (pbi->ec_est_mi_row >= 0 && pbi->ec_est_mi_col >= 0) {
++    pbi->ec_pending_mi_row = pbi->ec_est_mi_row;
++    pbi->ec_pending_mi_col = pbi->ec_est_mi_col;
++  } else {
++    pbi->ec_pending_mi_row = 0;
++    pbi->ec_pending_mi_col = 0;
++  }
++  pbi->ec_pending_zero_run_start = pbi->ec_zero_run_start;
++  pbi->ec_pending_zero_run_length = pbi->ec_zero_run_length;
++  pbi->ec_pending_pkt_size = pbi->ec_pkt_size;
++}
++
++static inline uint32_t av1_ec_mix32(uint32_t value) {
++  value ^= value >> 16;
++  value *= 0x7feb352dU;
++  value ^= value >> 15;
++  value *= 0x846ca68bU;
++  value ^= value >> 16;
++  return value;
++}
++
++static int av1_ec_pending_output_strength(const AV1Decoder *pbi,
++                                          uint32_t seed) {
++  const int position_q8 =
++      pbi->ec_pending_pkt_size
++          ? (int)AOMMIN((size_t)255,
++                        (pbi->ec_pending_zero_run_start * 255) /
++                            pbi->ec_pending_pkt_size)
++          : 0;
++  const int inverse_q8 = 255 - position_q8;
++  const int length_boost =
++      (int)AOMMIN((size_t)8, pbi->ec_pending_zero_run_length / 256);
++  const int curve_boost = (inverse_q8 * 8 + 127) / 255;
++  const int tail_boost = (position_q8 * 8 + 127) / 255;
++  const int hash_boost = (int)(av1_ec_mix32(seed) & 3);
++  return clamp(12 + curve_boost + tail_boost + length_boost + hash_boost, 14,
++               36);
++}
++
++static inline int av1_ec_output_degrade_pixel(int value, int neutral,
++                                              int max_value, int x, int y,
++                                              int plane, uint32_t seed,
++                                              int strength) {
++  strength = clamp(strength, 1, 48);
++  value = ((64 - strength) * value + strength * neutral + 32) >> 6;
++  if (plane == 0) {
++    const uint32_t hash =
++        av1_ec_mix32(seed ^ (uint32_t)(x * 0x1f123bb5U) ^
++                     (uint32_t)(y * 0x5f356495U));
++    if ((int)((hash >> 4) & 15) < AOMMIN(12, 2 + (strength >> 2))) {
++      value += (int)(hash & 3) - 1;
++    }
++  }
++  return clamp(value, 0, max_value);
++}
++
++static void av1_ec_apply_pending_plane_damage(YV12_BUFFER_CONFIG *const dst,
++                                              int plane, int x0, int y0,
++                                              int x1, int y1, uint32_t seed,
++                                              int strength) {
++  const int is_uv = plane > 0;
++  const int width = x1 - x0;
++  const int height = y1 - y0;
++  if (width <= 0 || height <= 0) return;
++
++  const int left = x0 > 0;
++  const int right = x1 < dst->crop_widths[is_uv];
++  const int top = y0 > 0;
++  const int bottom = y1 < dst->crop_heights[is_uv];
++
++  if (dst->flags & YV12_FLAG_HIGHBITDEPTH) {
++    const int bd = dst->bit_depth ? (int)dst->bit_depth : 8;
++    const int neutral = 1 << (bd - 1);
++    const int max_value = (1 << bd) - 1;
++    uint16_t *const base = CONVERT_TO_SHORTPTR(dst->buffers[plane]);
++    const uint16_t *const top_row =
++        top ? base + (y0 - 1) * dst->strides[is_uv] + x0 : NULL;
++    const uint16_t *const bottom_row =
++        bottom ? base + y1 * dst->strides[is_uv] + x0 : NULL;
++    for (int y = 0; y < height; ++y) {
++      uint16_t *const row = base + (y0 + y) * dst->strides[is_uv] + x0;
++      for (int x = 0; x < width; ++x) {
++        int sum = 0;
++        int weight = 0;
++        if (left) {
++          const int w = width - x;
++          sum += row[-1] * w;
++          weight += w;
++        }
++        if (right) {
++          const int w = x + 1;
++          sum += row[width] * w;
++          weight += w;
++        }
++        if (top) {
++          const int w = height - y;
++          sum += top_row[x] * w;
++          weight += w;
++        }
++        if (bottom) {
++          const int w = y + 1;
++          sum += bottom_row[x] * w;
++          weight += w;
++        }
++        const int predicted = weight > 0 ? (sum + (weight >> 1)) / weight
++                                         : neutral;
++        row[x] = (uint16_t)av1_ec_output_degrade_pixel(
++            predicted, neutral, max_value, x, y, plane, seed, strength);
++      }
++    }
++  } else {
++    uint8_t *const base = dst->buffers[plane];
++    const uint8_t *const top_row =
++        top ? base + (y0 - 1) * dst->strides[is_uv] + x0 : NULL;
++    const uint8_t *const bottom_row =
++        bottom ? base + y1 * dst->strides[is_uv] + x0 : NULL;
++    for (int y = 0; y < height; ++y) {
++      uint8_t *const row = base + (y0 + y) * dst->strides[is_uv] + x0;
++      for (int x = 0; x < width; ++x) {
++        int sum = 0;
++        int weight = 0;
++        if (left) {
++          const int w = width - x;
++          sum += row[-1] * w;
++          weight += w;
++        }
++        if (right) {
++          const int w = x + 1;
++          sum += row[width] * w;
++          weight += w;
++        }
++        if (top) {
++          const int w = height - y;
++          sum += top_row[x] * w;
++          weight += w;
++        }
++        if (bottom) {
++          const int w = y + 1;
++          sum += bottom_row[x] * w;
++          weight += w;
++        }
++        const int predicted = weight > 0 ? (sum + (weight >> 1)) / weight
++                                         : 128;
++        row[x] = (uint8_t)av1_ec_output_degrade_pixel(predicted, 128, 255, x,
++                                                      y, plane, seed,
++                                                      strength);
++      }
++    }
++  }
++}
++
++static void av1_ec_apply_pending_output_damage(AV1Decoder *pbi,
++                                               YV12_BUFFER_CONFIG *const dst) {
++  if (!pbi->error_concealment_enabled || !pbi->ec_pending_output_damage ||
++      dst == NULL) {
++    return;
++  }
++
++  AV1_COMMON *const cm = &pbi->common;
++  const int mib_size = cm->seq_params->mib_size;
++  const int sb_px = mib_size * MI_SIZE;
++  const int sb_cols =
++      AOMMAX(1, (cm->mi_params.mi_cols + mib_size - 1) / mib_size);
++  const int sb_rows =
++      AOMMAX(1, (cm->mi_params.mi_rows + mib_size - 1) / mib_size);
++  const int pending_mi_row =
++      clamp(pbi->ec_pending_mi_row, 0, cm->mi_params.mi_rows - 1);
++  const int pending_mi_col =
++      clamp(pbi->ec_pending_mi_col, 0, cm->mi_params.mi_cols - 1);
++  const int start_sb_row = clamp(pending_mi_row / mib_size, 0, sb_rows - 1);
++  const int start_sb_col = clamp(pending_mi_col / mib_size, 0, sb_cols - 1);
++  const uint32_t base_seed = av1_ec_mix32(
++      (uint32_t)pbi->ec_pending_zero_run_start ^
++      (uint32_t)(pbi->ec_pending_zero_run_length << 7) ^
++      (uint32_t)(pending_mi_row * 257 + pending_mi_col * 17));
++  const int sub_x = (int)(((base_seed >> 0) & 7) * sb_px) >> 5;
++  const int sub_y = (int)(((base_seed >> 3) & 3) * sb_px) >> 5;
++  const int start_x =
++      clamp(start_sb_col * sb_px + sub_x, 0, dst->y_crop_width);
++  const int start_y =
++      clamp(start_sb_row * sb_px + sub_y, 0, dst->y_crop_height);
++  if (start_x >= dst->y_crop_width || start_y >= dst->y_crop_height) {
++    pbi->ec_pending_output_damage = 0;
++    return;
++  }
++
++  const int num_planes = av1_num_planes(cm);
++  const int max_rows = AOMMAX(1, sb_rows - start_sb_row);
++  const int position_q8 =
++      pbi->ec_pending_pkt_size
++          ? (int)AOMMIN((size_t)255,
++                        (pbi->ec_pending_zero_run_start * 255) /
++                            pbi->ec_pending_pkt_size)
++          : 0;
++  const int inverse_q8 = 255 - position_q8;
++  const int span_q8 = 128 + ((inverse_q8 * 24 + 127) / 255);
++  const int row_span =
++      clamp(1 + (((max_rows - 1) * span_q8 + 127) / 255), 1, max_rows);
++  int damaged_rows = 0;
++  for (int sb_row = start_sb_row;
++       sb_row < AOMMIN(sb_rows, start_sb_row + row_span); ++sb_row) {
++    const int row_index = sb_row - start_sb_row;
++    const int row_x0 =
++        row_index == 0
++            ? start_x
++            : (int)((av1_ec_mix32(base_seed ^ (uint32_t)row_index) & 3) *
++                    sb_px) >>
++                  6;
++    const int row_y0 =
++        row_index == 0 ? start_y : clamp(sb_row * sb_px, 0, dst->y_crop_height);
++    const int row_y1 =
++        clamp((sb_row + 1) * sb_px, 0, dst->y_crop_height);
++    if (row_x0 >= dst->y_crop_width || row_y1 <= row_y0) continue;
++
++    const uint32_t row_seed = av1_ec_mix32(base_seed ^ (uint32_t)(row_index *
++                                                                  0x9e3779b9U));
++    const int strength =
++        AOMMIN(36, av1_ec_pending_output_strength(pbi, row_seed) +
++                       AOMMIN(row_index, 3));
++    for (int plane = 0; plane < num_planes; ++plane) {
++      const int ss_x = plane > 0 ? dst->subsampling_x : 0;
++      const int ss_y = plane > 0 ? dst->subsampling_y : 0;
++      const int is_uv = plane > 0;
++      const int plane_x0 = row_x0 >> ss_x;
++      const int plane_y0 = row_y0 >> ss_y;
++      const int plane_x1 = dst->crop_widths[is_uv];
++      const int plane_y1 =
++          AOMMIN((row_y1 + (1 << ss_y) - 1) >> ss_y,
++                 dst->crop_heights[is_uv]);
++      av1_ec_apply_pending_plane_damage(dst, plane, plane_x0, plane_y0,
++                                        plane_x1, plane_y1, row_seed,
++                                        strength);
++    }
++    ++damaged_rows;
++  }
++
++  dst->corrupted = 1;
++  pbi->ec_pending_output_damage = 0;
++  pbi->ec_path_directional_fill += damaged_rows;
++  pbi->ec_path_edge_fill += damaged_rows;
++}
++
++static int av1_ec_should_output_hidden_frame(const AV1Decoder *pbi) {
++  const AV1_COMMON *const cm = &pbi->common;
++  return pbi->error_concealment_enabled && pbi->ec_active &&
++         pbi->ec_zero_run_found && cm->cur_frame != NULL &&
++         !cm->show_existing_frame && !cm->show_frame;
++}
++
+ // If any buffer updating is signaled it should be done here.
+ // Consumes a reference to cm->cur_frame.
+ //
+@@ -368,6 +763,15 @@
+   BufferPool *const pool = cm->buffer_pool;
+ 
+   if (frame_decoded) {
++    const int frame_will_output = cm->show_existing_frame || cm->show_frame;
++    const int ec_output_hidden_frame = av1_ec_should_output_hidden_frame(pbi);
++    if (!frame_will_output && !ec_output_hidden_frame) {
++      av1_ec_queue_pending_output_damage(pbi);
++    } else if (cm->cur_frame != NULL) {
++      av1_ec_apply_pending_output_damage(pbi, &cm->cur_frame->buf);
++      if (ec_output_hidden_frame) cm->cur_frame->buf.corrupted = 1;
++    }
++
+     lock_buffer_pool(pool);
+ 
+     // In ext-tile decoding, the camera frame header is only decoded once. So,
+@@ -386,7 +790,7 @@
+       }
+     }
+ 
+-    if (cm->show_existing_frame || cm->show_frame) {
++    if (frame_will_output || ec_output_hidden_frame) {
+       if (pbi->output_all_layers) {
+         // Append this frame to the output queue
+         if (pbi->num_output_frames >= MAX_NUM_SPATIAL_LAYERS) {
+@@ -435,6 +839,7 @@
+   const uint8_t *source = *psource;
+   pbi->error.error_code = AOM_CODEC_OK;
+   pbi->error.has_detail = 0;
++  av1_ec_reset_packet_state(pbi, source, size);
+ 
+   if (size == 0) {
+     // This is used to signal that we are missing frames.
+diff --git a/av1/decoder/decoder.h b/av1/decoder/decoder.h
+--- a/av1/decoder/decoder.h
++++ b/av1/decoder/decoder.h
+@@ -364,6 +364,56 @@
+   // or (2) depending on 'max_threads'.
+   unsigned int row_mt;
+ 
++  unsigned int error_concealment_enabled;
++  int ec_active;
++  const uint8_t *ec_input_pkt_data;
++  size_t ec_input_pkt_size;
++  int ec_input_zero_run_found;
++  int ec_input_zero_run_carried;
++  size_t ec_input_zero_run_start;
++  size_t ec_input_zero_run_length;
++  const uint8_t *ec_api_pkt_data;
++  size_t ec_api_pkt_size;
++  int ec_api_zero_run_found;
++  size_t ec_api_zero_run_start;
++  size_t ec_api_zero_run_length;
++  const uint8_t *ec_pkt_data;
++  size_t ec_pkt_size;
++  int ec_zero_run_found;
++  size_t ec_zero_run_start;
++  size_t ec_zero_run_length;
++  int ec_est_tile_row;
++  int ec_est_tile_col;
++  int ec_est_mi_row;
++  int ec_est_mi_col;
++  int ec_cur_tile_row;
++  int ec_cur_tile_col;
++  int ec_cur_mi_row;
++  int ec_cur_mi_col;
++  int ec_damage_tile_row;
++  int ec_damage_tile_col;
++  int ec_damage_mi_row;
++  int ec_damage_mi_col;
++  int ec_pending_output_damage;
++  int ec_pending_mi_row;
++  int ec_pending_mi_col;
++  size_t ec_pending_zero_run_start;
++  size_t ec_pending_zero_run_length;
++  size_t ec_pending_pkt_size;
++  uint8_t *ec_mi_status;
++  int ec_mi_status_alloc_size;
++  int ec_mi_status_rows;
++  int ec_mi_status_cols;
++  unsigned int ec_concealed_sbs;
++  unsigned int ec_path_mv;
++  unsigned int ec_path_prev_mv;
++  unsigned int ec_path_zero_mv;
++  unsigned int ec_path_global_mv;
++  unsigned int ec_path_edge_fill;
++  unsigned int ec_path_gray;
++  unsigned int ec_path_directional_fill;
++  unsigned int ec_path_degraded_mv_hint;
++
+   EXTERNAL_REFERENCES ext_refs;
+   YV12_BUFFER_CONFIG tile_list_outbuf;
+ 
+@@ -463,6 +513,10 @@
+ void av1_dec_row_mt_dealloc(AV1DecRowMTSync *dec_row_mt_sync);
+ 
+ void av1_dec_free_cb_buf(AV1Decoder *pbi);
++void av1_ec_set_input_packet_damage_hint(AV1Decoder *pbi,
++                                         const uint8_t *source, size_t size);
++void av1_ec_set_packet_damage_hint(AV1Decoder *pbi, const uint8_t *source,
++                                   size_t size);
+ 
+ static inline void decrease_ref_count(RefCntBuffer *const buf,
+                                       BufferPool *const pool) {

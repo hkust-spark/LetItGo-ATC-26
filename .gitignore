@@ -1,0 +1,9 @@
+# Local editor and environment files. Experiment outputs are ignored by
+# motivation/.gitignore.
+.DS_Store
+*~
+*.swp
+*.swo
+/.vscode/
+/.idea/
+/.venv/
